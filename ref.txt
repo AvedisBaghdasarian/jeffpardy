@@ -1,0 +1,611 @@
+’d build it like this: nominal capability mixins, state-specific methods, and Game as the only thing that installs transitions.
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import TypeVar, cast
+
+
+# ============================================================
+# Errors / basic types
+# ============================================================
+
+class InvalidAction(RuntimeError):
+    pass
+
+
+ClueId = str
+PlayerId = str
+
+
+class Round(Enum):
+    JEOPARDY = auto()
+    DOUBLE_JEOPARDY = auto()
+    FINAL_JEOPARDY = auto()
+
+
+# ============================================================
+# Host action metadata
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class HostAction:
+    name: str
+    label: str
+
+
+# ============================================================
+# Base state
+# ============================================================
+
+class State:
+    @property
+    def available_host_actions(self) -> tuple[HostAction, ...]:
+        """
+        Discover actions from capability base classes.
+
+        No separate allowed-actions table is required.
+        """
+        actions: list[HostAction] = []
+        seen: set[str] = set()
+
+        for cls in type(self).__mro__:
+            action = cls.__dict__.get("action")
+
+            if (
+                isinstance(action, HostAction)
+                and action.name not in seen
+            ):
+                actions.append(action)
+                seen.add(action.name)
+
+        return tuple(actions)
+
+
+# ============================================================
+# Host capabilities
+# ============================================================
+
+class CanStartGame:
+    action = HostAction("start_game", "Start Game")
+
+    def start_game(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanFinishIntro:
+    action = HostAction("finish_intro", "Start Round")
+
+    def finish_intro(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanPickClue:
+    action = HostAction("pick_clue", "Pick Clue")
+
+    def pick_clue(
+        self,
+        game: Game,
+        clue_id: ClueId,
+    ) -> State:
+        raise NotImplementedError
+
+
+class CanOpenBuzzers:
+    action = HostAction("open_buzzers", "Open Buzzers")
+
+    def open_buzzers(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanSelectBuzzer:
+    action = HostAction("select_buzzer", "Select Buzzer")
+
+    def select_buzzer(
+        self,
+        game: Game,
+        player_id: PlayerId,
+    ) -> State:
+        raise NotImplementedError
+
+
+class CanMarkCorrect:
+    action = HostAction("correct", "Correct")
+
+    def correct(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanMarkIncorrect:
+    action = HostAction("incorrect", "Incorrect")
+
+    def incorrect(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanCloseClue:
+    action = HostAction("close_clue", "Close Clue")
+
+    def close_clue(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanFinishRound:
+    action = HostAction("finish_round", "Finish Round")
+
+    def finish_round(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanStartNextRound:
+    action = HostAction("start_next_round", "Start Next Round")
+
+    def start_next_round(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanOpenFinalWagering:
+    action = HostAction(
+        "open_final_wagering",
+        "Open Final Wagering",
+    )
+
+    def open_final_wagering(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanCloseFinalWagering:
+    action = HostAction(
+        "close_final_wagering",
+        "Close Final Wagering",
+    )
+
+    def close_final_wagering(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanStartFinalReveal:
+    action = HostAction(
+        "start_final_reveal",
+        "Start Final Reveal",
+    )
+
+    def start_final_reveal(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanEndGame:
+    action = HostAction("end_game", "End Game")
+
+    def end_game(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanPause:
+    action = HostAction("pause", "Pause")
+
+    def pause(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+class CanResume:
+    action = HostAction("resume", "Resume")
+
+    def resume(self, game: Game) -> State:
+        raise NotImplementedError
+
+
+# ============================================================
+# Pausable state
+# ============================================================
+
+class PausableState(State, CanPause):
+    def pause(self, game: Game) -> State:
+        return Paused(previous=self)
+
+
+# ============================================================
+# Main game states
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class Lobby(State, CanStartGame):
+    def start_game(self, game: Game) -> State:
+        return Intro()
+
+
+@dataclass(frozen=True, slots=True)
+class Intro(PausableState, CanFinishIntro):
+    def finish_intro(self, game: Game) -> State:
+        game.round = Round.JEOPARDY
+        return Board()
+
+
+@dataclass(frozen=True, slots=True)
+class Board(
+    PausableState,
+    CanPickClue,
+    CanFinishRound,
+):
+    def pick_clue(
+        self,
+        game: Game,
+        clue_id: ClueId,
+    ) -> State:
+        return Asking(clue_id=clue_id)
+
+    def finish_round(self, game: Game) -> State:
+        if game.round is Round.JEOPARDY:
+            return RoundIntermission(
+                next_round=Round.DOUBLE_JEOPARDY
+            )
+
+        if game.round is Round.DOUBLE_JEOPARDY:
+            game.round = Round.FINAL_JEOPARDY
+            return FinalCategory()
+
+        raise InvalidAction("Final Jeopardy has no board round")
+
+
+@dataclass(frozen=True, slots=True)
+class Asking(
+    PausableState,
+    CanOpenBuzzers,
+):
+    clue_id: ClueId
+
+    def open_buzzers(self, game: Game) -> State:
+        return BuzzersOpen(
+            clue_id=self.clue_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BuzzersOpen(
+    PausableState,
+    CanSelectBuzzer,
+    CanCloseClue,
+):
+    clue_id: ClueId
+
+    def select_buzzer(
+        self,
+        game: Game,
+        player_id: PlayerId,
+    ) -> State:
+        return Answering(
+            clue_id=self.clue_id,
+            player_id=player_id,
+        )
+
+    def close_clue(self, game: Game) -> State:
+        return Board()
+
+
+@dataclass(frozen=True, slots=True)
+class Answering(
+    PausableState,
+    CanMarkCorrect,
+    CanMarkIncorrect,
+):
+    clue_id: ClueId
+    player_id: PlayerId
+
+    def correct(self, game: Game) -> State:
+        game.score_correct(
+            player_id=self.player_id,
+            clue_id=self.clue_id,
+        )
+
+        return Board()
+
+    def incorrect(self, game: Game) -> State:
+        game.score_incorrect(
+            player_id=self.player_id,
+            clue_id=self.clue_id,
+        )
+
+        return BuzzersOpen(
+            clue_id=self.clue_id,
+        )
+
+
+# ============================================================
+# Between rounds
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class RoundIntermission(
+    PausableState,
+    CanStartNextRound,
+):
+    next_round: Round
+
+    def start_next_round(self, game: Game) -> State:
+        game.round = self.next_round
+        return Board()
+
+
+# ============================================================
+# Final Jeopardy
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class FinalCategory(
+    PausableState,
+    CanOpenFinalWagering,
+):
+    def open_final_wagering(self, game: Game) -> State:
+        return FinalWagering()
+
+
+@dataclass(frozen=True, slots=True)
+class FinalWagering(
+    PausableState,
+    CanCloseFinalWagering,
+):
+    def close_final_wagering(self, game: Game) -> State:
+        return FinalClue()
+
+
+@dataclass(frozen=True, slots=True)
+class FinalClue(
+    PausableState,
+    CanStartFinalReveal,
+):
+    def start_final_reveal(self, game: Game) -> State:
+        return FinalReveal()
+
+
+@dataclass(frozen=True, slots=True)
+class FinalReveal(
+    PausableState,
+    CanEndGame,
+):
+    def end_game(self, game: Game) -> State:
+        return GameOver()
+
+
+@dataclass(frozen=True, slots=True)
+class GameOver(State):
+    pass
+
+
+# ============================================================
+# Pause
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class Paused(State, CanResume):
+    previous: State
+
+    def resume(self, game: Game) -> State:
+        return self.previous
+
+
+# ============================================================
+# Game
+# ============================================================
+
+Capability = TypeVar("Capability")
+
+
+@dataclass(slots=True)
+class Game:
+    id: str
+
+    state: State = field(
+        default_factory=Lobby,
+        init=False,
+    )
+
+    round: Round = field(
+        default=Round.JEOPARDY,
+        init=False,
+    )
+
+    # --------------------------------------------------------
+    # State-machine plumbing
+    # --------------------------------------------------------
+
+    @property
+    def available_host_actions(
+        self,
+    ) -> tuple[HostAction, ...]:
+        return self.state.available_host_actions
+
+    def _require(
+        self,
+        capability: type[Capability],
+    ) -> Capability:
+        state = self.state
+
+        if not isinstance(state, capability):
+            raise InvalidAction(
+                f"{capability.action.name!r} is not available "
+                f"while in {type(state).__name__}"
+            )
+
+        return cast(Capability, state)
+
+    def _transition(self, next_state: State) -> None:
+        self.state = next_state
+
+    # --------------------------------------------------------
+    # Host API
+    # --------------------------------------------------------
+
+    def start_game(self) -> None:
+        state = self._require(CanStartGame)
+        self._transition(state.start_game(self))
+
+    def finish_intro(self) -> None:
+        state = self._require(CanFinishIntro)
+        self._transition(state.finish_intro(self))
+
+    def pick_clue(self, clue_id: ClueId) -> None:
+        state = self._require(CanPickClue)
+        self._transition(
+            state.pick_clue(self, clue_id)
+        )
+
+    def open_buzzers(self) -> None:
+        state = self._require(CanOpenBuzzers)
+        self._transition(state.open_buzzers(self))
+
+    def select_buzzer(
+        self,
+        player_id: PlayerId,
+    ) -> None:
+        state = self._require(CanSelectBuzzer)
+
+        self._transition(
+            state.select_buzzer(
+                self,
+                player_id,
+            )
+        )
+
+    def correct(self) -> None:
+        state = self._require(CanMarkCorrect)
+        self._transition(state.correct(self))
+
+    def incorrect(self) -> None:
+        state = self._require(CanMarkIncorrect)
+        self._transition(state.incorrect(self))
+
+    def close_clue(self) -> None:
+        state = self._require(CanCloseClue)
+        self._transition(state.close_clue(self))
+
+    def finish_round(self) -> None:
+        state = self._require(CanFinishRound)
+        self._transition(state.finish_round(self))
+
+    def start_next_round(self) -> None:
+        state = self._require(CanStartNextRound)
+        self._transition(state.start_next_round(self))
+
+    def open_final_wagering(self) -> None:
+        state = self._require(CanOpenFinalWagering)
+        self._transition(
+            state.open_final_wagering(self)
+        )
+
+    def close_final_wagering(self) -> None:
+        state = self._require(CanCloseFinalWagering)
+        self._transition(
+            state.close_final_wagering(self)
+        )
+
+    def start_final_reveal(self) -> None:
+        state = self._require(CanStartFinalReveal)
+        self._transition(
+            state.start_final_reveal(self)
+        )
+
+    def end_game(self) -> None:
+        state = self._require(CanEndGame)
+        self._transition(state.end_game(self))
+
+    def pause(self) -> None:
+        state = self._require(CanPause)
+        self._transition(state.pause(self))
+
+    def resume(self) -> None:
+        state = self._require(CanResume)
+        self._transition(state.resume(self))
+
+    # --------------------------------------------------------
+    # Domain operations
+    # --------------------------------------------------------
+
+    def score_correct(
+        self,
+        player_id: PlayerId,
+        clue_id: ClueId,
+    ) -> None:
+        # scoring implementation belongs elsewhere
+        pass
+
+    def score_incorrect(
+        self,
+        player_id: PlayerId,
+        clue_id: ClueId,
+    ) -> None:
+        # scoring implementation belongs elsewhere
+        pass
+
+The resulting flow is:
+
+Lobby
+  └─ start_game
+       ↓
+Intro
+  └─ finish_intro
+       ↓
+Board
+  ├─ pick_clue
+  │    ↓
+  │  Asking
+  │    └─ open_buzzers
+  │         ↓
+  │     BuzzersOpen
+  │       ├─ select_buzzer
+  │       │      ↓
+  │       │   Answering
+  │       │     ├─ correct   → Board
+  │       │     └─ incorrect → BuzzersOpen
+  │       │
+  │       └─ close_clue → Board
+  │
+  └─ finish_round
+       ↓
+RoundIntermission
+  └─ start_next_round → Board
+
+after Double Jeopardy:
+
+Board
+  └─ finish_round
+       ↓
+FinalCategory
+  └─ open_final_wagering
+       ↓
+FinalWagering
+  └─ close_final_wagering
+       ↓
+FinalClue
+  └─ start_final_reveal
+       ↓
+FinalReveal
+  └─ end_game
+       ↓
+GameOver
+
+And the nice part is what the host sees:
+
+game = Game("game-123")
+
+game.available_host_actions
+# (HostAction(name="start_game", label="Start Game"),)
+
+game.start_game()
+
+game.available_host_actions
+# (
+#   HostAction(name="finish_intro", label="Start Round"),
+#   HostAction(name="pause", label="Pause"),
+# )
+
+There is no separate transition table and no allowed_actions list to keep synchronized. The inheritance itself defines the capabilities:
+
+class Answering(
+    PausableState,
+    CanMarkCorrect,
+    CanMarkIncorrect,
+):
+    ...
+
+That declaration tells you almost everything you need to know about the state before reading its implementation.
